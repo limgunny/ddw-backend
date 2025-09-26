@@ -48,7 +48,8 @@ CORS(app, resources={
         "origins": [
             "http://localhost:3000", 
             "http://127.0.0.1:3000",
-            "https://ddw-frontend-zpvi.vercel.app"
+            "https://ddw-frontend-zpvi.vercel.app",
+            "https://ddw-backend.onrender.com"
         ], 
         "supports_credentials": True,
         "allow_headers": ["Content-Type", "Authorization"] # [추가] DELETE와 같은 요청에 포함된 Authorization 헤더를 허용
