@@ -45,7 +45,11 @@ app = Flask(__name__)
 # supports_credentials=True 옵션이 없으면 브라우저가 Authorization 헤더가 포함된 요청을 차단합니다.
 CORS(app, resources={
     r"/api/*": {
-        "origins": ["http://localhost:3000", "http://127.0.0.1:3000"], 
+        "origins": [
+            "http://localhost:3000", 
+            "http://127.0.0.1:3000",
+            "https://ddw-frontend-zpvi.vercel.app"
+        ], 
         "supports_credentials": True,
         "allow_headers": ["Content-Type", "Authorization"] # [추가] DELETE와 같은 요청에 포함된 Authorization 헤더를 허용
     }
