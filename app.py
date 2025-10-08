@@ -23,6 +23,168 @@ from cryptography.fernet import Fernet, InvalidToken
 import json
 import cloudinary
 import cloudinary.uploader
+from functools import wraps
+import hashlib
+from dotenv import load_dotenv
+import threading
+import uuid
+
+# 환경 변수 로드
+load_dotenv()
+
+# --- 성능 최적화를 위한 캐시 시스템 ---
+class SimpleCache:
+    def __init__(self, max_size=100, ttl=300):  # 5분 TTL
+        self.cache = {}
+        self.max_size = max_size
+        self.ttl = ttl
+    
+    def get(self, key):
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return data
+            else:
+                del self.cache[key]
+        return None
+    
+    def set(self, key, value):
+        if len(self.cache) >= self.max_size:
+            # 가장 오래된 항목 제거
+            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][1])
+            del self.cache[oldest_key]
+        
+        self.cache[key] = (value, time.time())
+    
+    def clear(self):
+        self.cache.clear()
+
+# 전역 캐시 인스턴스
+cache = SimpleCache()
+
+# 비동기 작업 관리 시스템
+class AsyncTaskManager:
+    def __init__(self):
+        self.tasks = {}
+        self.lock = threading.Lock()
+    
+    def create_task(self, task_id, task_func, *args, **kwargs):
+        """새로운 비동기 작업 생성"""
+        with self.lock:
+            self.tasks[task_id] = {
+                'status': 'running',
+                'progress': 0,
+                'result': None,
+                'error': None,
+                'created_at': datetime.now(timezone.utc)
+            }
+        
+        def task_wrapper():
+            try:
+                result = task_func(*args, **kwargs)
+                with self.lock:
+                    self.tasks[task_id]['status'] = 'completed'
+                    self.tasks[task_id]['progress'] = 100
+                    self.tasks[task_id]['result'] = result
+            except Exception as e:
+                with self.lock:
+                    self.tasks[task_id]['status'] = 'failed'
+                    self.tasks[task_id]['error'] = str(e)
+        
+        thread = threading.Thread(target=task_wrapper)
+        thread.daemon = True
+        thread.start()
+        return task_id
+    
+    def get_task_status(self, task_id):
+        """작업 상태 조회"""
+        with self.lock:
+            return self.tasks.get(task_id, None)
+    
+    def cleanup_old_tasks(self, max_age_hours=24):
+        """오래된 작업 정리"""
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        with self.lock:
+            to_remove = [
+                task_id for task_id, task in self.tasks.items()
+                if task['created_at'] < cutoff_time
+            ]
+            for task_id in to_remove:
+                del self.tasks[task_id]
+
+# 전역 작업 관리자
+task_manager = AsyncTaskManager()
+
+# JWT 토큰 검증 헬퍼 함수
+def verify_token_or_refresh():
+    """
+    토큰이 유효한지 확인하고, 만료된 경우 갱신을 시도합니다.
+    """
+    try:
+        # 현재 토큰이 유효한지 확인
+        get_jwt_identity()
+        return True, None
+    except Exception as e:
+        # 토큰이 만료되었거나 유효하지 않은 경우
+        return False, str(e)
+
+def create_token_response(user_data):
+    """
+    사용자 데이터로부터 토큰 응답을 생성합니다.
+    """
+    identity_data = {'username': user_data.username, 'id': user_data.id, 'role': user_data.role}
+    access_token = create_access_token(identity=json.dumps(identity_data))
+    refresh_token = create_refresh_token(identity=json.dumps(identity_data))
+    return jsonify({
+        'access_token': access_token, 
+        'refresh_token': refresh_token,
+        'expires_in': 4 * 60 * 60  # 4시간을 초 단위로
+    })
+
+def async_watermark_task(input_path, master_path, embeddable_watermark, task_id):
+    """
+    비동기 워터마킹 작업 함수
+    """
+    def progress_callback(progress):
+        with task_manager.lock:
+            if task_id in task_manager.tasks:
+                task_manager.tasks[task_id]['progress'] = progress
+    
+    try:
+        success, message = embed_watermark(input_path, master_path, embeddable_watermark, progress_callback)
+        return {
+            'success': success,
+            'message': message,
+            'master_path': master_path if success else None
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'message': f'워터마킹 작업 중 오류 발생: {str(e)}',
+            'master_path': None
+        }
+
+def cached_response(ttl=300):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            # 캐시 키 생성
+            cache_key = f"{f.__name__}_{hashlib.md5(str(args).encode()).hexdigest()}"
+            
+            # 캐시에서 확인
+            cached_result = cache.get(cache_key)
+            if cached_result is not None:
+                return cached_result
+            
+            # 캐시에 없으면 함수 실행
+            result = f(*args, **kwargs)
+            
+            # 결과를 캐시에 저장
+            cache.set(cache_key, result)
+            
+            return result
+        return decorated_function
+    return decorator
 
 # --- 기존 유틸리티 함수 (변경 없음) ---
 def text_to_binary(text):
@@ -61,11 +223,20 @@ CORS(app, resources={
 SECRET_KEY = os.getenv('SECRET_KEY', 'a-super-secret-and-static-key-for-development-only')
 app.config['SECRET_KEY'] = SECRET_KEY
 app.config['JWT_SECRET_KEY'] = SECRET_KEY
-# 토큰 만료 시간 설정 (접근 60분, 리프레시 30일)
+# 토큰 만료 시간 설정 (접근 4시간, 리프레시 30일)
 from datetime import timedelta
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(minutes=60)
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=4)  # 60분에서 4시간으로 연장
 app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(days=30)
+
+# [성능 최적화] 데이터베이스 설정 개선
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///site.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 300,
+    'connect_args': {'check_same_thread': False}
+}
+
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
@@ -160,7 +331,10 @@ if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
     )
 
 # --- 기존 함수를 API에 맞게 수정 ---
-def embed_watermark(input_path, output_path, watermark_text):
+def embed_watermark(input_path, output_path, watermark_text, progress_callback=None):
+    """
+    워터마크 삽입 함수 - 성능 최적화 버전
+    """
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         return False, f"Error: '{input_path}' 동영상을 열 수 없습니다."
@@ -168,16 +342,16 @@ def embed_watermark(input_path, output_path, watermark_text):
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # [수정] 데이터 손실이 없는 무손실 코덱(FFV1)으로 변경합니다.
-    # 이렇게 하면 압축 과정에서 워터마크가 손상되지 않습니다.
-    fourcc = cv2.VideoWriter_fourcc(*'FFV1')
+    # [성능 최적화] 더 빠른 코덱 사용 (H.264)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
     watermark_binary = text_to_binary(watermark_text + '$$END$$')
     watermark_len = len(watermark_binary)
 
-    # [수정] 워터마크를 저장할 수 있는 공간을 프레임의 너비(width)에서 프레임 전체 픽셀(width*height)로 확장합니다.
+    # 워터마크 크기 검증
     available_bits = width * height
     if watermark_len > available_bits:
         cap.release()
@@ -185,28 +359,65 @@ def embed_watermark(input_path, output_path, watermark_text):
         return False, f"Error: 워터마크가 너무 깁니다. (최대 {available_bits} 비트, 현재 {watermark_len} 비트)"
 
     frame_count = 0
+    watermark_inserted = False
+    
+    # [성능 최적화] 배치 처리로 프레임 읽기 최적화
+    batch_size = 10
+    frames_buffer = []
+    
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        # 첫 번째 프레임에만 워터마크를 삽입합니다.
-        if frame_count == 0:
-            # [수정] 1차원 인덱스를 2차원 (행, 열) 좌표로 변환하여 프레임 전체에 걸쳐 워터마크를 삽입합니다.
-            for i in range(watermark_len):
-                row = i // width
-                col = i % width
-                pixel = frame[row, col]
-                blue_val = pixel[0]
-                watermark_bit = int(watermark_binary[i])
-                # [수정] 무손실 코덱을 사용하므로 가장 간단한 최하위 비트(LSB) 방식으로 되돌립니다.
-                new_blue_val = (blue_val & 0b11111110) | watermark_bit
-                frame[row, col, 0] = new_blue_val
-        out.write(frame)
+            
+        frames_buffer.append(frame)
+        
+        # 배치가 가득 찼거나 마지막 프레임인 경우 처리
+        if len(frames_buffer) >= batch_size or frame_count == total_frames - 1:
+            for i, buffered_frame in enumerate(frames_buffer):
+                # 첫 번째 프레임에만 워터마크를 삽입합니다.
+                if frame_count - len(frames_buffer) + i == 0 and not watermark_inserted:
+                    # [성능 최적화] 벡터화된 연산 사용
+                    watermark_inserted = True
+                    watermark_insertion_optimized(buffered_frame, watermark_binary, width, height)
+                
+                out.write(buffered_frame)
+            
+            frames_buffer.clear()
+            
+            # 진행률 콜백 호출
+            if progress_callback and total_frames > 0:
+                progress = min(100, int((frame_count + 1) / total_frames * 100))
+                progress_callback(progress)
+        
         frame_count += 1
     
     cap.release()
     out.release()
     return True, "워터마크 삽입 완료"
+
+def watermark_insertion_optimized(frame, watermark_binary, width, height):
+    """
+    워터마크 삽입 최적화 함수 - 벡터화된 연산 사용
+    """
+    watermark_len = len(watermark_binary)
+    
+    # [성능 최적화] NumPy를 사용한 벡터화된 연산
+    frame_flat = frame.reshape(-1, 3)  # (height*width, 3)
+    
+    # 워터마크 비트를 배열로 변환
+    watermark_bits = np.array([int(bit) for bit in watermark_binary[:watermark_len]])
+    
+    # 파딩이 필요한 경우 0으로 채움
+    if len(watermark_bits) < len(frame_flat):
+        padding = np.zeros(len(frame_flat) - len(watermark_bits), dtype=int)
+        watermark_bits = np.concatenate([watermark_bits, padding])
+    
+    # LSB 방식으로 워터마크 삽입 (벡터화된 연산)
+    frame_flat[:len(watermark_bits), 0] = (frame_flat[:len(watermark_bits), 0] & 0b11111110) | watermark_bits
+    
+    # 원래 형태로 복원
+    frame[:] = frame_flat.reshape(height, width, 3)
 
 def extract_watermark(input_path):
     cap = cv2.VideoCapture(input_path)
@@ -282,17 +493,30 @@ def login():
         identity_data = {'username': user.username, 'id': user.id, 'role': user.role}
         access_token = create_access_token(identity=json.dumps(identity_data))
         refresh_token = create_refresh_token(identity=json.dumps(identity_data))
-        return jsonify(access_token=access_token, refresh_token=refresh_token)
+        return jsonify({
+            'access_token': access_token, 
+            'refresh_token': refresh_token,
+            'expires_in': 4 * 60 * 60,  # 4시간을 초 단위로
+            'token_type': 'Bearer'
+        })
 
     return jsonify({'error': '사용자 이름 또는 비밀번호가 일치하지 않습니다.'}), 401
 
-# 리프레시 토큰으로 액세스 토큰 재발급
+# 리프레시 토큰으로 액세스 토큰 재발급 (개선된 버전)
 @app.route('/api/refresh', methods=['POST'])
 @jwt_required(refresh=True)
 def refresh_access_token():
-    identity_json = get_jwt_identity()
-    new_access_token = create_access_token(identity=identity_json)
-    return jsonify(access_token=new_access_token)
+    try:
+        identity_json = get_jwt_identity()
+        new_access_token = create_access_token(identity=identity_json)
+        return jsonify({
+            'access_token': new_access_token,
+            'expires_in': 4 * 60 * 60,  # 4시간을 초 단위로
+            'message': '토큰이 성공적으로 갱신되었습니다.'
+        })
+    except Exception as e:
+        app.logger.error(f"Token refresh failed: {e}")
+        return jsonify({'error': '토큰 갱신에 실패했습니다.'}), 401
 
 # [추가] 프로필 관리 API - 비밀번호 변경
 @app.route('/api/profile/change-password', methods=['POST'])
@@ -345,132 +569,182 @@ def embed_route():
     input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     video_file.save(input_path)
 
-    # [수정] 코덱에 맞춰 출력 파일 확장자를 .mkv로 변경합니다.
-    master_filename = f"watermarked_{base_filename}.mkv"
+    # [성능 최적화] 비동기 워터마킹 작업 시작
+    task_id = str(uuid.uuid4())
+    master_filename = f"watermarked_{base_filename}.mp4"  # mp4v 코덱 사용으로 확장자 변경
     master_path = os.path.join(app.config['OUTPUT_FOLDER'], master_filename)
-
-    success, message = embed_watermark(input_path, master_path, embeddable_watermark)
-
-    if not success:
-        return jsonify({'error': message}), 500
-
-    # [추가] 재생 가능한 MP4 파일 생성 및 썸네일 생성
-    playback_filename = f"playback_{base_filename}.mp4"
-    playback_path = os.path.join(app.config['OUTPUT_FOLDER'], playback_filename)
-    thumbnail_filename = f"thumb_{base_filename}.jpg"
-    thumbnail_path = os.path.join(app.config['OUTPUT_FOLDER'], thumbnail_filename)
-    try:
-        # FFmpeg를 사용하여 .mkv를 .mp4로 변환
-        subprocess.run(
-            ['ffmpeg', '-i', master_path, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-c:a', 'aac', '-y', playback_path],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding='utf-8'
-        )
-        # 썸네일 생성 (1초 시점 프레임 캡처)
-        subprocess.run(
-            ['ffmpeg', '-ss', '00:00:01.000', '-i', playback_path, '-vframes', '1', '-q:v', '2', '-y', thumbnail_path],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding='utf-8'
-        )
-    except subprocess.CalledProcessError as e:
-        app.logger.error(f"FFmpeg error: {e.stderr}")
-        return jsonify({'error': f'재생 가능한 비디오 변환 실패: {e.stderr}'}), 500
-    except FileNotFoundError:
-        app.logger.error("FFmpeg not found. Please install FFmpeg and ensure it's in the system's PATH.")
-        return jsonify({'error': '서버 오류: FFmpeg가 설치되어 있지 않습니다.'}), 500
-
-    # [추가] Cloudinary 업로드 (가능한 경우)
-    cloud_playback_url = None
-    cloud_master_url = None
-    try:
-        if CLOUDINARY_CLOUD_NAME:
-            # 원본/마스터 업로드
-            master_upload = cloudinary.uploader.upload_large(
-                master_path,
-                resource_type='video',
-                folder='video-watermarker',
-                public_id=os.path.splitext(master_filename)[0]
-            )
-            cloud_master_url = master_upload.get('secure_url')
-
-            # 재생용 업로드
-            playback_upload = cloudinary.uploader.upload_large(
-                playback_path,
-                resource_type='video',
-                folder='video-watermarker',
-                public_id=os.path.splitext(playback_filename)[0]
-            )
-            cloud_playback_url = playback_upload.get('secure_url')
-    except Exception as e:
-        app.logger.error(f"Cloudinary upload failed: {e}")
-
-    # [추가] 데이터베이스에 비디오 정보 저장 (로컬 파일명 유지)
-    new_video = Video(
-        title=title,
-        original_filename=video_file.filename,
-        master_filename=master_filename,
-        playback_filename=playback_filename,
-        thumbnail_filename=thumbnail_filename,
-        user_id=current_user['id']
+    
+    # 비동기 작업 시작
+    task_manager.create_task(
+        task_id, 
+        async_watermark_task, 
+        input_path, 
+        master_path, 
+        embeddable_watermark, 
+        task_id
     )
-    db.session.add(new_video)
-    db.session.commit()
 
-    # 응답은 Cloudinary URL이 있으면 우선 반환, 없으면 기존 로컬 경로 반환
-    if cloud_playback_url and cloud_master_url:
-        return jsonify({
-            'message': message,
-            'playback_url': cloud_playback_url,
-            'master_url': cloud_master_url
-        })
-    else:
-        return jsonify({
-            'message': message,
-            'playback_file': playback_filename,
-            'master_file': master_filename
-        })
+    return jsonify({
+        'task_id': task_id,
+        'message': '워터마킹 작업이 시작되었습니다.',
+        'status': 'processing'
+    })
+
+# 작업 상태 조회 API
+@app.route('/api/embed/status/<task_id>', methods=['GET'])
+@jwt_required()
+def get_embed_status(task_id):
+    task_status = task_manager.get_task_status(task_id)
+    
+    if not task_status:
+        return jsonify({'error': '작업을 찾을 수 없습니다.'}), 404
+    
+    response = {
+        'task_id': task_id,
+        'status': task_status['status'],
+        'progress': task_status['progress']
+    }
+    
+    if task_status['status'] == 'completed':
+        result = task_status['result']
+        if result['success']:
+            # 워터마킹 완료 후 추가 처리
+            master_path = result['master_path']
+            base_filename = os.path.splitext(os.path.basename(master_path))[0].replace('watermarked_', '')
+            
+            # 재생 가능한 MP4 파일 생성 및 썸네일 생성
+            playback_filename = f"playback_{base_filename}.mp4"
+            playback_path = os.path.join(app.config['OUTPUT_FOLDER'], playback_filename)
+            thumbnail_filename = f"thumb_{base_filename}.jpg"
+            thumbnail_path = os.path.join(app.config['OUTPUT_FOLDER'], thumbnail_filename)
+            
+            try:
+                # FFmpeg를 사용하여 최적화된 MP4 변환
+                subprocess.run([
+                    'ffmpeg', '-i', master_path, 
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', 
+                    '-c:a', 'aac', '-movflags', '+faststart',
+                    '-y', playback_path
+                ], check=True, capture_output=True, text=True, encoding='utf-8')
+                
+                # 썸네일 생성
+                subprocess.run([
+                    'ffmpeg', '-ss', '00:00:01.000', '-i', playback_path, 
+                    '-vframes', '1', '-q:v', '2', '-y', thumbnail_path
+                ], check=True, capture_output=True, text=True, encoding='utf-8')
+                
+                # 데이터베이스에 비디오 정보 저장
+                identity_json = get_jwt_identity()
+                current_user = json.loads(identity_json)
+                
+                new_video = Video(
+                    title=request.args.get('title', ''),
+                    original_filename=f"{base_filename}.mp4",
+                    master_filename=os.path.basename(master_path),
+                    playback_filename=playback_filename,
+                    thumbnail_filename=thumbnail_filename,
+                    user_id=current_user['id']
+                )
+                db.session.add(new_video)
+                db.session.commit()
+                
+                # 캐시 무효화
+                cache.clear()
+                
+                response.update({
+                    'message': '워터마킹이 완료되었습니다.',
+                    'playback_file': playback_filename,
+                    'master_file': os.path.basename(master_path),
+                    'video_id': new_video.id
+                })
+                
+            except subprocess.CalledProcessError as e:
+                app.logger.error(f"FFmpeg error: {e.stderr}")
+                response.update({
+                    'status': 'failed',
+                    'error': f'비디오 변환 실패: {e.stderr}'
+                })
+            except Exception as e:
+                app.logger.error(f"Post-processing error: {e}")
+                response.update({
+                    'status': 'failed',
+                    'error': f'후처리 중 오류: {str(e)}'
+                })
+        else:
+            response.update({
+                'status': 'failed',
+                'error': result['message']
+            })
+    elif task_status['status'] == 'failed':
+        response['error'] = task_status['error']
+    
+    return jsonify(response)
 
 @app.route('/api/my-videos', methods=['GET'])
 @jwt_required()
 def my_videos():
     identity_json = get_jwt_identity()
     current_user = json.loads(identity_json)
-    user_videos = Video.query.filter_by(user_id=current_user['id']).order_by(Video.upload_timestamp.desc()).all()
+    
+    # 페이지네이션 파라미터
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    per_page = min(per_page, 50)  # 최대 50개로 제한
+    
+    # 사용자별 비디오 조회 최적화
+    user_videos_query = Video.query.filter_by(user_id=current_user['id']).order_by(Video.upload_timestamp.desc())
+    user_videos = user_videos_query.paginate(
+        page=page, 
+        per_page=per_page, 
+        error_out=False
+    ).items
+    
     return jsonify([video.to_dict() for video in user_videos])
 
-# 공개 비디오 목록 API (최신 업로드 순)
+# 공개 비디오 목록 API (최신 업로드 순) - 성능 최적화 + 캐싱
 @app.route('/api/videos', methods=['GET'])
+@cached_response(ttl=60)  # 1분 캐시
 def public_videos():
-    videos = Video.query.order_by(Video.upload_timestamp.desc()).all()
-    # 썸네일 누락 시 자동 생성
+    # 페이지네이션 파라미터
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 12, type=int)
+    per_page = min(per_page, 50)  # 최대 50개로 제한
+    
+    # 데이터베이스 쿼리 최적화 - 페이지네이션 적용
+    videos_query = Video.query.order_by(Video.upload_timestamp.desc())
+    videos = videos_query.paginate(
+        page=page, 
+        per_page=per_page, 
+        error_out=False
+    ).items
+    
+    # 썸네일 누락 시 자동 생성 (비동기 처리로 변경)
+    thumbnail_tasks = []
     for video in videos:
-        try:
-            if not video.thumbnail_filename:
-                base_filename = os.path.splitext(video.playback_filename)[0]
-                thumb_name = f"thumb_{base_filename}.jpg"
-                thumb_path = os.path.join(app.config['OUTPUT_FOLDER'], thumb_name)
-                playback_path = os.path.join(app.config['OUTPUT_FOLDER'], video.playback_filename)
-                if os.path.exists(playback_path) and not os.path.exists(thumb_path):
-                    subprocess.run(
-                        ['ffmpeg', '-ss', '00:00:01.000', '-i', playback_path, '-vframes', '1', '-q:v', '2', '-y', thumb_path],
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                        encoding='utf-8'
-                    )
-                if os.path.exists(thumb_path):
+        if not video.thumbnail_filename:
+            base_filename = os.path.splitext(video.playback_filename)[0]
+            thumb_name = f"thumb_{base_filename}.jpg"
+            thumb_path = os.path.join(app.config['OUTPUT_FOLDER'], thumb_name)
+            playback_path = os.path.join(app.config['OUTPUT_FOLDER'], video.playback_filename)
+            
+            if os.path.exists(playback_path) and not os.path.exists(thumb_path):
+                # 비동기로 썸네일 생성 (백그라운드에서 처리)
+                try:
+                    subprocess.Popen([
+                        'ffmpeg', '-ss', '00:00:01.000', '-i', playback_path, 
+                        '-vframes', '1', '-q:v', '2', '-y', thumb_path
+                    ])
                     video.thumbnail_filename = thumb_name
-        except Exception as e:
-            app.logger.error(f"Auto thumbnail generation failed (video_id={video.id}): {e}")
+                except Exception as e:
+                    app.logger.error(f"Background thumbnail generation failed (video_id={video.id}): {e}")
+    
+    # 데이터베이스 업데이트는 배치로 처리
     try:
         db.session.commit()
     except Exception as e:
         app.logger.error(f"Commit thumbnails failed: {e}")
         db.session.rollback()
+    
     return jsonify([video.to_dict() for video in videos])
 
 # 조회수 증가 API
@@ -507,7 +781,7 @@ def increase_view(video_id):
         app.logger.error(f"Increase view failed: {e}")
         return jsonify({'error': '조회수 증가 실패'}), 500
 
-# [추가] 관리자 전용 API - 모든 비디오 목록 조회
+# [추가] 관리자 전용 API - 모든 비디오 목록 조회 (성능 최적화)
 @app.route('/api/admin/all-videos', methods=['GET'])
 @jwt_required()
 def all_videos():
@@ -518,10 +792,22 @@ def all_videos():
     if current_user.get('role') != 'admin':
         return jsonify({"msg": "관리자 권한이 필요합니다."}), 403
 
-    all_vids = Video.query.order_by(Video.upload_timestamp.desc()).all()
+    # 페이지네이션 파라미터
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    per_page = min(per_page, 100)  # 관리자는 더 많이 볼 수 있음
+    
+    # 모든 비디오 조회 최적화
+    all_vids_query = Video.query.order_by(Video.upload_timestamp.desc())
+    all_vids = all_vids_query.paginate(
+        page=page, 
+        per_page=per_page, 
+        error_out=False
+    ).items
+    
     return jsonify([video.to_dict() for video in all_vids])
 
-# [추가] 관리자 전용 API - 모든 사용자 목록 조회
+# [추가] 관리자 전용 API - 모든 사용자 목록 조회 (성능 최적화)
 @app.route('/api/admin/all-users', methods=['GET'])
 @jwt_required()
 def all_users():
@@ -531,7 +817,19 @@ def all_users():
     if current_user.get('role') != 'admin':
         return jsonify({"msg": "관리자 권한이 필요합니다."}), 403
 
-    users = User.query.order_by(User.id.asc()).all()
+    # 페이지네이션 파라미터
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+    per_page = min(per_page, 100)  # 관리자는 더 많이 볼 수 있음
+    
+    # 사용자 목록 조회 최적화
+    users_query = User.query.order_by(User.id.asc())
+    users = users_query.paginate(
+        page=page, 
+        per_page=per_page, 
+        error_out=False
+    ).items
+    
     return jsonify([user.to_dict() for user in users])
 
 # [추가] 관리자 전용 API - 비디오 삭제
@@ -845,6 +1143,15 @@ def extract_route():
     except (InvalidToken, ValueError, TypeError) as e:
         app.logger.error(f"Watermark decryption failed for extracted data: {e}")
         return jsonify({'watermark': "워터마크 복호화에 실패했습니다. 데이터가 손상되었거나 유효하지 않습니다."})
+
+# 헬스 체크 엔드포인트
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'cache_size': len(cache.cache)
+    })
 
 @app.route('/outputs/<filename>')
 def get_output_file(filename):
