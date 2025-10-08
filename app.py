@@ -563,32 +563,72 @@ def embed_route():
     video_file = request.files['video']
     title = request.form.get('title')
 
-    # 고유한 파일명 생성
-    base_filename = f"{int(time.time())}_{video_file.filename.rsplit('.', 1)[0]}"
-    filename = f"{base_filename}.{video_file.filename.rsplit('.', 1)[-1]}"
-    input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    video_file.save(input_path)
+    # 파일 유효성 검사
+    if not video_file or video_file.filename == '':
+        return jsonify({'error': '파일이 선택되지 않았습니다.'}), 400
+    
+    # 파일명 처리 (안전한 방식)
+    try:
+        if '.' not in video_file.filename:
+            return jsonify({'error': '파일 확장자가 없습니다.'}), 400
+        
+        name, ext = video_file.filename.rsplit('.', 1)
+        if not name or not ext:
+            return jsonify({'error': '잘못된 파일명입니다.'}), 400
+            
+        # 고유한 파일명 생성
+        base_filename = f"{int(time.time())}_{name}"
+        filename = f"{base_filename}.{ext}"
+        input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        
+        # 디렉토리 존재 확인 및 생성
+        os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+        
+        # 파일 저장
+        video_file.save(input_path)
+        
+        # 파일 저장 확인
+        if not os.path.exists(input_path):
+            return jsonify({'error': '파일 저장에 실패했습니다.'}), 500
+            
+    except Exception as e:
+        app.logger.error(f"파일 처리 중 오류: {e}")
+        return jsonify({'error': f'파일 처리 중 오류가 발생했습니다: {str(e)}'}), 500
 
     # [성능 최적화] 비동기 워터마킹 작업 시작
-    task_id = str(uuid.uuid4())
-    master_filename = f"watermarked_{base_filename}.mp4"  # mp4v 코덱 사용으로 확장자 변경
-    master_path = os.path.join(app.config['OUTPUT_FOLDER'], master_filename)
-    
-    # 비동기 작업 시작
-    task_manager.create_task(
-        task_id, 
-        async_watermark_task, 
-        input_path, 
-        master_path, 
-        embeddable_watermark, 
-        task_id
-    )
+    try:
+        task_id = str(uuid.uuid4())
+        master_filename = f"watermarked_{base_filename}.mp4"  # mp4v 코덱 사용으로 확장자 변경
+        master_path = os.path.join(app.config['OUTPUT_FOLDER'], master_filename)
+        
+        # 출력 디렉토리 생성
+        os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
+        
+        # 비동기 작업 시작
+        task_manager.create_task(
+            task_id, 
+            async_watermark_task, 
+            input_path, 
+            master_path, 
+            embeddable_watermark, 
+            task_id
+        )
 
-    return jsonify({
-        'task_id': task_id,
-        'message': '워터마킹 작업이 시작되었습니다.',
-        'status': 'processing'
-    })
+        return jsonify({
+            'task_id': task_id,
+            'message': '워터마킹 작업이 시작되었습니다.',
+            'status': 'processing'
+        })
+        
+    except Exception as e:
+        app.logger.error(f"워터마킹 작업 시작 중 오류: {e}")
+        # 업로드된 파일 정리
+        try:
+            if os.path.exists(input_path):
+                os.remove(input_path)
+        except:
+            pass
+        return jsonify({'error': f'워터마킹 작업 시작에 실패했습니다: {str(e)}'}), 500
 
 # 작업 상태 조회 API
 @app.route('/api/embed/status/<task_id>', methods=['GET'])
